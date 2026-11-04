@@ -4,7 +4,7 @@ How to create a VM on the server and give someone access to it, without giving t
 
 These commands are for **LXD 4.0 on Ubuntu 20.04**, which is why ports are forwarded with proxy devices and not `lxc network forward`. After a move to Incus, replace `lxc` with `incus` and `lxdbr0` with `incusbr0`.
 
-To do sections 1 to 5 in one go, run `sudo ./create-vm.sh` on the server. It asks for each value, then gives you the SSH command to hand over. Section 7 onwards still applies to VMs created this way.
+To do sections 1 to 5 in one go, run `sudo ./create-vm.sh` on the server. It asks for each value, then gives you the SSH command to hand over. It can also publish the VM's websites through the shared proxy VM (section 8). Section 7 onwards still applies to VMs created this way.
 
 Each block says where to run it:
 
@@ -181,7 +181,7 @@ Host vm2
 
 ## 7. Forward an app port (optional)
 
-Do this when the VM runs a website or backend. Two VMs can use the same port inside, but each needs its own port on the server. Here port `5556` on the server leads to port `5555` in the VM.
+Use this for a service that isn't a website, or for quick tests. For public websites, use the proxy VM (section 8): it gives you HTTPS and normal addresses. Two VMs can use the same port inside, but each needs its own port on the server. Here port `5556` on the server leads to port `5555` in the VM.
 
 **Server:** the VM must be stopped to add a device.
 
@@ -199,7 +199,67 @@ Allow TCP `5556` in the hosting provider's firewall too. The site is then at `ht
 
 The app must listen on `0.0.0.0`, not `127.0.0.1`. Check with `sudo lxc exec "$VM" -- ss -tlnp`.
 
-## 8. Monitor
+## 8. Publish websites through the proxy VM
+
+With a single server IP, ports 80 and 443 can only lead to one place. All websites therefore go through one VM, `proxy`, which runs Caddy. Caddy sends each domain to the right VM and gets HTTPS certificates automatically.
+
+```
+Internet ──> server :80/:443 ──> proxy VM (Caddy) ──┬──> site.com      → vm2:5555
+                                                     └──> api.site.com  → vm3:4444
+```
+
+`create-vm.sh` sets this up when you answer yes to "Publish web services". The first time, it creates `proxy`; after that, it adds each new VM's domains to it.
+
+For a VM that already exists, or to add domains to a VM later, run `sudo ./publish-sites.sh` on the server. It asks for the VM and the domains, then:
+
+- **Fixed IP:** if the VM has none, it fixes its current IP, which restarts the VM once.
+- **Firewall inside the VM:** if it's off, it asks before turning it on. Turning it on keeps the ports already forwarded from the server open.
+- **Existing sites:** new domains are added to the VM's file on the proxy, and the old file is put back if Caddy rejects the result.
+
+On the proxy VM, the configuration is split per VM:
+
+| File | Contents |
+|---|---|
+| `/etc/caddy/Caddyfile` | Global settings, and a line that loads every file in `sites/` |
+| `/etc/caddy/sites/<vm>.caddy` | The domains of one VM |
+
+A site only works when all of these are true:
+
+- The domain has a DNS **A record** pointing to the server's public IP, and **no AAAA record**.
+- The service listens on `0.0.0.0` inside its VM. The VM's own firewall (ufw) only lets the proxy VM reach that port.
+- TCP 80 and 443 are allowed in the hosting provider's firewall.
+
+**Check the certificates**, on the **server**:
+
+```bash
+sudo lxc exec proxy -- journalctl -u caddy -n 50
+```
+
+Look for `certificate obtained successfully` for each domain.
+
+**Add a domain by hand**, without the script, on the **server**. This example publishes port 3000 of `vm2`:
+
+```bash
+sudo lxc exec proxy -- nano /etc/caddy/sites/vm2.caddy
+```
+
+Add a block like the others, with the VM's IP:
+
+```
+app.site.com {
+	reverse_proxy 10.158.92.11:3000
+}
+```
+
+Then apply it and open the port to the proxy VM:
+
+```bash
+sudo lxc exec proxy -- sh -c "caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy"
+sudo lxc exec vm2 -- ufw allow proto tcp from <proxy-ip> to any port 3000
+sudo ufw route allow proto tcp from <proxy-ip> to 10.158.92.11 port 3000
+```
+
+## 9. Monitor
 
 **All VMs**, on the **server**:
 
@@ -236,7 +296,7 @@ sudo lxc storage info default
 sudo lxc info --resources
 ```
 
-## 9. Daily management
+## 10. Daily management
 
 All on the **server**:
 
@@ -255,7 +315,7 @@ All on the **server**:
 
 Disk growth usually applies after the next restart.
 
-## 10. Remove access or delete a VM
+## 11. Remove access or delete a VM
 
 All on the **server**.
 
@@ -281,7 +341,16 @@ sudo ufw status numbered       # find the VM's rules
 sudo ufw delete <number>       # repeat for each; the numbers shift after each delete
 ```
 
-## 11. Troubleshooting
+If the VM had websites on the proxy VM, remove them too. Otherwise Caddy keeps answering those domains with errors:
+
+```bash
+sudo lxc exec proxy -- rm /etc/caddy/sites/vm2.caddy
+sudo lxc exec proxy -- systemctl reload caddy
+```
+
+Don't delete the `proxy` VM itself while other VMs still have websites on it.
+
+## 12. Troubleshooting
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
@@ -289,10 +358,12 @@ sudo ufw delete <number>       # repeat for each; the numbers shift after each d
 | `Connection refused` from outside, but `ssh` from the server works | fail2ban banned that IP (bans lift after about 10 minutes) | Run `fail2ban-client status sshd`, then unban the IP |
 | `Connection refused` from the server too | SSH isn't running, or the IP is wrong | Check `sudo lxc list`, then `sudo lxc exec vm2 -- ss -tlnp` for `:22` |
 | `Permission denied` with no password prompt | Password login isn't enabled for this user | Redo the password step in section 4 |
-| `Permission denied` after typing the password | Wrong password | Reset it with `passwd` (section 9) |
+| `Permission denied` after typing the password | Wrong password | Reset it with `passwd` (section 10) |
 | `Device cannot be added when instance is running` | LXD 4.0 needs the VM stopped | Stop the VM, add the device, start it |
 | `VM agent isn't currently running` | The VM is still booting | Wait 30 seconds and try again |
 | `unknown command "forward"` | LXD 4.0 doesn't have this command | Use a proxy device (section 3) |
 | A website gets `Connection refused` | The app only listens on `127.0.0.1` | Make it listen on `0.0.0.0` |
+| A proxied site shows `502 Bad Gateway` | The service isn't running, listens on `127.0.0.1` only, or the VM's ufw blocks the proxy | Check `ss -tlnp` and `ufw status` inside the VM |
+| Caddy's log shows certificate errors | DNS isn't pointing to the server, there's an AAAA record, or port 80 is blocked | Check `dig +short <domain>` on your Mac and the firewalls. Caddy retries on its own |
 
 To see where an SSH connection stops, add `-v`: `ssh -v -p 2223 bob@<server-ip>`.

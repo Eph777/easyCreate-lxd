@@ -1,105 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ufw translates its output, which is parsed below
-export LC_ALL=C
-
-VM_CREATED=no
-
-die() {
-  echo "$*" >&2
-  exit 1
-}
-
-if [[ $EUID -ne 0 ]]; then
-  die "This script must be run as root (try: sudo $0)"
-fi
-
-if ! command -v lxc >/dev/null; then
-  die "LXD is not installed (try: snap install lxd, then lxd init)"
-fi
-
-on_exit() {
-  local status=$?
-  if [[ $status -ne 0 && $VM_CREATED == "yes" ]]; then
-    echo "Setup stopped before finishing, so $VM is only partly configured." >&2
-    echo "To remove it and start again: lxc delete $VM --force" >&2
-  fi
-}
-trap on_exit EXIT
-
-ask() {
-  local var=$1 prompt=$2 default=${3:-} reply
-  if [[ -n $default ]]; then
-    read -rp "$prompt [$default]: " reply
-  else
-    read -rp "$prompt: " reply
-  fi
-  printf -v "$var" '%s' "${reply:-$default}"
-}
-
-ask_valid() {
-  local var=$1 prompt=$2 default=$3 check=$4
-  while true; do
-    ask "$var" "$prompt" "$default"
-    if "$check" "${!var}"; then
-      return 0
-    fi
-  done
-}
-
-is_ipv4() {
-  [[ $1 =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
-  local octet
-  for octet in ${1//./ }; do
-    if ((octet > 255)); then
-      return 1
-    fi
-  done
-}
-
-ip_to_int() {
-  local a b c d
-  IFS=. read -r a b c d <<<"$1"
-  echo $(((a << 24) | (b << 16) | (c << 8) | d))
-}
-
-int_to_ip() {
-  echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"
-}
-
-ip_taken() {
-  grep -Fxq "$1" <<<"$USED_IPS"
-}
-
-next_free_ip() {
-  local n
-  for ((n = NETWORK + 10; n < BROADCAST; n++)); do
-    if ! ip_taken "$(int_to_ip "$n")"; then
-      int_to_ip "$n"
-      return 0
-    fi
-  done
-}
-
-# USED_PORTS holds single ports and ranges such as 4000-4999
-port_taken() {
-  local entry
-  for entry in $USED_PORTS; do
-    if (($1 >= ${entry%-*} && $1 <= ${entry#*-})); then
-      return 0
-    fi
-  done
-  return 1
-}
-
-next_free_port() {
-  local port=$1
-  while port_taken "$port"; do
-    port=$((port + 1))
-  done
-  echo "$port"
-}
+. "$(dirname "$(readlink -f "$0")")/common.sh"
 
 to_mib() {
   local size=${1%?iB}
@@ -112,6 +14,10 @@ to_mib() {
 check_name() {
   if [[ ! $1 =~ ^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
     echo "Use letters, numbers and hyphens, starting with a letter."
+    return 1
+  fi
+  if [[ $1 == "$PROXY_VM" ]]; then
+    echo "$PROXY_VM is reserved for the reverse proxy VM."
     return 1
   fi
   if lxc info "$1" >/dev/null 2>&1; then
@@ -160,35 +66,8 @@ check_cpus() {
   fi
 }
 
-check_vm_ip() {
-  if ! is_ipv4 "$1"; then
-    echo "That is not a valid IP address."
-    return 1
-  fi
-  local ip_int
-  ip_int=$(ip_to_int "$1")
-  if ((ip_int <= NETWORK || ip_int >= BROADCAST)); then
-    echo "The IP must be inside $BRIDGE_CIDR."
-    return 1
-  fi
-  if ip_taken "$1"; then
-    echo "$1 is already used."
-    return 1
-  fi
-}
-
-check_server_ip() {
-  if ! grep -Fxq "$1" <<<"$SERVER_IPS"; then
-    echo "$1 is not on this server. Addresses found:" $SERVER_IPS
-    return 1
-  fi
-}
-
 check_ssh_port() {
-  if [[ ! $1 =~ ^[1-9][0-9]{0,4}$ ]] || (($1 > 65535)); then
-    echo "Use a port from 1 to 65535."
-    return 1
-  fi
+  check_port "$1" || return 1
   if port_taken "$1"; then
     echo "Port $1 is already used on this server."
     return 1
@@ -220,38 +99,7 @@ ask_password() {
   done
 }
 
-# The profile names the bridge under "network" or "parent", depending on how it was set up
-BRIDGE=$(lxc profile device get default eth0 network 2>/dev/null || true)
-if [[ -z $BRIDGE ]]; then
-  BRIDGE=$(lxc profile device get default eth0 parent 2>/dev/null || true)
-fi
-if [[ -z $BRIDGE ]]; then
-  lxc network list >&2
-  die "The default profile has no eth0 network device. Has 'lxd init' been run?"
-fi
-
-BRIDGE_CIDR=$(ip -4 -o addr show dev "$BRIDGE" | awk 'NR == 1 {print $4}' || true)
-if [[ ! $BRIDGE_CIDR =~ ^([0-9.]+)/([0-9]+)$ ]]; then
-  lxc network list >&2
-  die "Bridge $BRIDGE has no IPv4 address on this server."
-fi
-GATEWAY=${BASH_REMATCH[1]}
-PREFIX=${BASH_REMATCH[2]}
-MASK=$(((0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF))
-NETWORK=$(($(ip_to_int "$GATEWAY") & MASK))
-BROADCAST=$((NETWORK | (~MASK & 0xFFFFFFFF)))
-
-USED_IPS=$GATEWAY
-USED_PORTS=$(ss -Htln | awk '{print $4}' | sed 's/.*://' | tr '\n' ' ')
-for instance in $(lxc list -c n --format csv); do
-  devices=$(lxc config device show "$instance")
-  USED_IPS+=$'\n'$(sed -n 's/^ *ipv4.address: //p' <<<"$devices")
-  USED_PORTS+=" "$(sed -n 's/^ *listen: [a-z]*:.*:\([0-9,-]*\)$/\1/p' <<<"$devices" | tr ',\n' '  ')
-done
-USED_IPS+=$'\n'$(lxc list -c 4 --format csv | grep -oE '([0-9]+\.){3}[0-9]+' || true)
-
-SERVER_IPS=$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1)
-DEFAULT_SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)
+scan_server
 TOTAL_MIB=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
 AVAILABLE_MIB=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
 POOL=$(lxc profile device get default root pool)
@@ -271,9 +119,18 @@ ask_valid RAM "RAM" "4GiB" check_ram
 ask_valid CPUS "CPUs" "2" check_cpus
 ask_valid DISK "Disk" "20GiB" check_size
 ask_valid VM_IP "VM IP (inside $BRIDGE_CIDR)" "$(next_free_ip)" check_vm_ip
+USED_IPS+=$'\n'$VM_IP
 ask_valid SSH_PORT "SSH port on the server" "$(next_free_port 2222)" check_ssh_port
 ask_valid SERVER_IP "Server IP to listen on" "$DEFAULT_SERVER_IP" check_server_ip
 ask VM_SUDO "Give $VM_USER admin rights (sudo) inside the VM? (y/N)" "n"
+
+ask WEB "Publish web services from this VM through the reverse proxy? (y/N)" "n"
+SITES=""
+NEW_PROXY=no
+if [[ $WEB =~ ^[yY] ]]; then
+  ask_proxy
+  ask_sites
+fi
 
 cat <<EOF
 
@@ -285,16 +142,23 @@ Disk:      $DISK
 VM IP:     $VM_IP
 SSH user:  $VM_USER
 SSH port:  $SERVER_IP:$SSH_PORT -> $VM_IP:22
-
 EOF
+if [[ -n $SITES ]]; then
+  print_sites_summary
+fi
+echo
 ask CONFIRM "Create this VM? (y/N)" "n"
 if [[ ! $CONFIRM =~ ^[yY] ]]; then
   echo "Nothing was created."
   exit 0
 fi
 
-lxc init "ubuntu:$VERSION" "$VM" --vm -c limits.memory="$RAM" -c limits.cpu="$CPUS"
-VM_CREATED=yes
+if [[ $NEW_PROXY == "yes" ]]; then
+  create_proxy
+fi
+
+lxc init "ubuntu:$VERSION" "$VM" --vm -c limits.memory="$RAM" -c limits.cpu="$CPUS" -c boot.autostart=true
+PARTIAL_VMS+=" $VM"
 lxc config device override "$VM" root size="$DISK"
 lxc config device override "$VM" eth0 ipv4.address="$VM_IP"
 lxc config device add "$VM" ssh-forward proxy \
@@ -302,18 +166,7 @@ lxc config device add "$VM" ssh-forward proxy \
   connect=tcp:"$VM_IP":22 \
   nat=true
 lxc start "$VM"
-
-echo "Waiting for the VM to boot..."
-attempts=0
-until lxc exec "$VM" -- true 2>/dev/null; do
-  attempts=$((attempts + 1))
-  if ((attempts >= 90)); then
-    die "The VM did not boot within 3 minutes (see: lxc info $VM --show-log)"
-  fi
-  sleep 2
-done
-# cloud-init exits with 2 on recoverable errors, which don't stop the setup
-lxc exec "$VM" -- cloud-init status --wait >/dev/null || true
+wait_for_vm "$VM"
 
 echo "Creating user $VM_USER..."
 lxc exec "$VM" -- useradd -m -s /bin/bash "$VM_USER"
@@ -327,11 +180,23 @@ fi
 lxc exec "$VM" -- sh -c "printf '\nMatch User $VM_USER\n    PasswordAuthentication yes\n' >> /etc/ssh/sshd_config && mkdir -p /run/sshd && sshd -t && systemctl restart ssh"
 
 echo "Installing fail2ban..."
-lxc exec "$VM" -- sh -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban"
+lxc exec "$VM" -- sh -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban ufw"
 
-if command -v ufw >/dev/null && [[ "$(ufw status)" == *"Status: active"* ]]; then
+# Only SSH and, for each service, the proxy VM may connect to this VM
+if [[ -n $SITES ]]; then
+  lxc exec "$VM" -- sh -c "ufw allow 22/tcp && $(vm_proxy_rules) && ufw --force enable"
+fi
+
+if ufw_active; then
   ufw route allow proto tcp to "$VM_IP" port 22
 fi
+
+if [[ -n $SITES ]]; then
+  open_host_firewall
+  echo "Publishing the sites on $PROXY_VM..."
+  publish_sites
+fi
+PARTIAL_VMS=${PARTIAL_VMS/ $VM/}
 
 if ! timeout 5 bash -c "exec 3<>/dev/tcp/$VM_IP/22"; then
   echo "Warning: SSH is not answering on $VM_IP:22 yet." >&2
@@ -352,3 +217,8 @@ if [[ $PASSWORD_GENERATED == "yes" ]]; then
 fi
 echo "If the server's public IP is different from $SERVER_IP, connect to the public IP instead."
 echo "If your hosting provider has a firewall, allow TCP port $SSH_PORT there."
+
+if [[ -n $SITES ]]; then
+  echo
+  print_sites_instructions
+fi
