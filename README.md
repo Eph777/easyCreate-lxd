@@ -53,7 +53,7 @@ Only Incus is upgraded; other system packages are left untouched. Running contai
 sudo ./create-vm.sh
 ```
 
-It asks for the VM's name, user, password, resources, IP and SSH port, and suggests free values. It can also publish the VM's websites over HTTPS through a shared reverse proxy VM, so many VMs can host sites behind a single server IP.
+It asks for the VM's name, user, password, resources, IP and SSH port, and suggests free values. It can also publish the VM's websites over HTTPS through a shared reverse proxy VM running [Nginx Proxy Manager](https://nginxproxymanager.com/), so many VMs can host sites behind a single server IP.
 
 To publish websites from a VM that already exists, or to add domains to a VM later:
 
@@ -61,4 +61,10 @@ To publish websites from a VM that already exists, or to add domains to a VM lat
 sudo ./publish-sites.sh
 ```
 
-Both scripts share their code through `common.sh`, so keep the three files in the same folder. [VM-GUIDE.md](VM-GUIDE.md) explains each step and how to monitor and manage the VMs.
+To create the reverse proxy VM on its own, or to switch an existing one from Caddy to Nginx Proxy Manager:
+
+```bash
+sudo ./install-npm.sh
+```
+
+The scripts share their code through `common.sh`, so keep all the files in the same folder. [VM-GUIDE.md](VM-GUIDE.md) explains each step and how to monitor and manage the VMs.

@@ -193,8 +193,7 @@ fi
 
 if [[ -n $SITES ]]; then
   open_host_firewall
-  echo "Publishing the sites on $PROXY_VM..."
-  publish_sites
+  publish_on_proxy
 fi
 PARTIAL_VMS=${PARTIAL_VMS/ $VM/}
 

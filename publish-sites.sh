@@ -54,7 +54,7 @@ if [[ -z $VM_IP ]]; then
 fi
 
 ask_proxy
-if [[ $NEW_PROXY == "no" ]]; then
+if [[ $PROXY_KIND == "caddy" ]]; then
   existing=$(lxc exec "$PROXY_VM" -- sh -c "cat /etc/caddy/sites/$VM.caddy 2>/dev/null" | sed -n 's/^\([^ {]*\) {$/\1/p' | tr '\n' ' ' || true)
   if [[ -n $existing ]]; then
     echo "Already published for $VM: $existing"
@@ -122,8 +122,7 @@ case $VM_FIREWALL in
 esac
 
 open_host_firewall
-echo "Publishing the sites on $PROXY_VM..."
-publish_sites
+publish_on_proxy
 
 echo
 print_sites_instructions

@@ -1,4 +1,4 @@
-# Shared by create-vm.sh and publish-sites.sh, not meant to be run on its own
+# Shared by create-vm.sh, publish-sites.sh and install-npm.sh, not meant to be run on its own
 
 # ufw translates its output, which is parsed below
 export LC_ALL=C
@@ -6,6 +6,8 @@ export LC_ALL=C
 # The VM that receives ports 80 and 443 and sends each domain to the right VM
 PROXY_VM=proxy
 PARTIAL_VMS=""
+# Printed if the script fails, to say how to undo what it already changed
+FAILURE_HINT=""
 
 die() {
   echo "$*" >&2
@@ -27,6 +29,9 @@ on_exit() {
       echo "Setup stopped before finishing, so $vm is only partly configured." >&2
       echo "To remove it and start again: lxc delete $vm --force" >&2
     done
+    if [[ -n $FAILURE_HINT ]]; then
+      echo "$FAILURE_HINT" >&2
+    fi
   fi
 }
 trap on_exit EXIT
@@ -162,13 +167,6 @@ check_domain() {
   fi
 }
 
-check_email() {
-  if [[ ! $1 =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
-    echo "Use an email address like you@example.com."
-    return 1
-  fi
-}
-
 wait_for_vm() {
   local attempts=0
   echo "Waiting for $1 to boot..."
@@ -221,7 +219,57 @@ scan_server() {
   DEFAULT_SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)
 }
 
-# Sets NEW_PROXY, PROXY_IP and USED_DOMAINS, and asks what a new proxy VM needs
+# Deleting a VM leaves its site file on the proxy, which keeps its domains taken
+remove_stale_sites() {
+  local file vm stale=""
+  for file in $(lxc exec "$PROXY_VM" -- sh -c 'ls /etc/caddy/sites/ 2>/dev/null' || true); do
+    vm=${file%.caddy}
+    if [[ $file == *.caddy ]] && ! lxc info "$vm" >/dev/null 2>&1; then
+      stale+=" $vm"
+    fi
+  done
+  if [[ -z $stale ]]; then
+    return 0
+  fi
+  echo "These VMs no longer exist but still have sites on $PROXY_VM:$stale"
+  ask REMOVE_STALE "Remove their sites from $PROXY_VM? (Y/n)" "y"
+  if [[ ! $REMOVE_STALE =~ ^[yY] ]]; then
+    return 0
+  fi
+  for vm in $stale; do
+    lxc exec "$PROXY_VM" -- rm -f "/etc/caddy/sites/$vm.caddy"
+  done
+  lxc exec "$PROXY_VM" -- sh -c "caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy"
+  echo "Removed. Their firewall rules on the server are still there (see: ufw status numbered)."
+}
+
+# Proxy VMs made before Nginx Proxy Manager run Caddy, until install-npm.sh replaces it
+proxy_uses_npm() {
+  lxc exec "$PROXY_VM" -- test -f /opt/npm/docker-compose.yml
+}
+
+proxy_name() {
+  if [[ $PROXY_KIND == "npm" ]]; then
+    echo "Nginx Proxy Manager"
+  else
+    echo "Caddy"
+  fi
+}
+
+# Sets PROXY_IP, and SERVER_IP if not set yet, for a proxy VM that doesn't exist yet
+ask_new_proxy() {
+  if port_taken 80 || port_taken 443; then
+    die "Ports 80 or 443 are already used on this server, by a service or by another instance's proxy device. If you set up Caddy inside a VM earlier, remove that VM's http and https devices first (see: lxc config device show <name>)."
+  fi
+  echo "There is no reverse proxy VM yet. It will be created as $PROXY_VM (1GiB RAM, 1 CPU) with Nginx Proxy Manager, and receive ports 80 and 443."
+  ask_valid PROXY_IP "Proxy VM IP (inside $BRIDGE_CIDR)" "$(next_free_ip)" check_vm_ip
+  USED_IPS+=$'\n'$PROXY_IP
+  if [[ -z ${SERVER_IP:-} ]]; then
+    ask_valid SERVER_IP "Server IP to listen on" "$DEFAULT_SERVER_IP" check_server_ip
+  fi
+}
+
+# Sets NEW_PROXY, PROXY_KIND (npm or caddy), PROXY_IP and USED_DOMAINS
 ask_proxy() {
   if lxc info "$PROXY_VM" >/dev/null 2>&1; then
     if ! is_running "$PROXY_VM"; then
@@ -232,21 +280,20 @@ ask_proxy() {
       die "The $PROXY_VM VM has no fixed IP, so other VMs can't be published through it."
     fi
     NEW_PROXY=no
-    USED_DOMAINS=$(lxc exec "$PROXY_VM" -- sh -c 'cat /etc/caddy/sites/*.caddy 2>/dev/null' | sed -n 's/^\([^ {]*\) {$/\1/p' || true)
-    echo "Using the existing reverse proxy VM $PROXY_VM ($PROXY_IP)."
+    if proxy_uses_npm; then
+      PROXY_KIND=npm
+      USED_DOMAINS=""
+    else
+      PROXY_KIND=caddy
+      remove_stale_sites
+      USED_DOMAINS=$(lxc exec "$PROXY_VM" -- sh -c 'cat /etc/caddy/sites/*.caddy 2>/dev/null' | sed -n 's/^\([^ {]*\) {$/\1/p' || true)
+    fi
+    echo "Using the existing reverse proxy VM $PROXY_VM ($PROXY_IP, $(proxy_name))."
   else
-    if port_taken 80 || port_taken 443; then
-      die "Ports 80 or 443 are already used on this server, by a service or by another instance's proxy device. If you set up Caddy inside a VM earlier, remove that VM's http and https devices first (see: lxc config device show <name>)."
-    fi
     NEW_PROXY=yes
+    PROXY_KIND=npm
     USED_DOMAINS=""
-    echo "There is no reverse proxy VM yet. It will be created as $PROXY_VM (1GiB RAM, 1 CPU) and receive ports 80 and 443."
-    ask_valid PROXY_IP "Proxy VM IP (inside $BRIDGE_CIDR)" "$(next_free_ip)" check_vm_ip
-    USED_IPS+=$'\n'$PROXY_IP
-    if [[ -z ${SERVER_IP:-} ]]; then
-      ask_valid SERVER_IP "Server IP to listen on" "$DEFAULT_SERVER_IP" check_server_ip
-    fi
-    ask_valid EMAIL "Email for Let's Encrypt certificate notices" "" check_email
+    ask_new_proxy
   fi
 }
 
@@ -287,9 +334,9 @@ vm_proxy_rules() {
 print_sites_summary() {
   local domain port
   if [[ $NEW_PROXY == "yes" ]]; then
-    echo "Proxy:     new VM $PROXY_VM at $PROXY_IP, receiving $SERVER_IP:80 and :443"
+    echo "Proxy:     new VM $PROXY_VM at $PROXY_IP with $(proxy_name), receiving $SERVER_IP:80 and :443"
   else
-    echo "Proxy:     existing VM $PROXY_VM at $PROXY_IP"
+    echo "Proxy:     existing VM $PROXY_VM at $PROXY_IP ($(proxy_name))"
   fi
   while read -r domain port; do
     if [[ -n $domain ]]; then
@@ -313,22 +360,58 @@ create_proxy() {
     nat=true
   lxc start "$PROXY_VM"
   wait_for_vm "$PROXY_VM"
-
-  echo "Installing Caddy..."
-  lxc exec "$PROXY_VM" -- sh -ec "
-    apt-get update
-    apt-get install -y curl gpg
-    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
-    chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
-    mkdir -p /etc/caddy/sites"
-
-  # Each VM gets its own file in /etc/caddy/sites, so removing a VM means removing one file
-  printf '{\n\temail %s\n}\n\nimport /etc/caddy/sites/*.caddy\n' "$EMAIL" |
-    lxc exec "$PROXY_VM" -- sh -c "cat > /etc/caddy/Caddyfile"
+  install_npm
+  start_npm
   PARTIAL_VMS=${PARTIAL_VMS/ $PROXY_VM/}
+}
+
+install_npm() {
+  echo "Installing Docker and Nginx Proxy Manager on $PROXY_VM..."
+  lxc exec "$PROXY_VM" -- sh -c "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 curl"
+  lxc exec "$PROXY_VM" -- sh -c "mkdir -p /opt/npm && cat > /opt/npm/docker-compose.yml" <<'EOF'
+services:
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: npm
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # The admin page only listens inside this VM, it is reached through an SSH tunnel
+      - "127.0.0.1:81:81"
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+EOF
+  # Downloading the image before anything stops keeps the sites' downtime short
+  lxc exec "$PROXY_VM" -- sh -c "cd /opt/npm && docker compose pull"
+}
+
+start_npm() {
+  local attempts=0
+  lxc exec "$PROXY_VM" -- sh -c "cd /opt/npm && docker compose up -d"
+  echo "Waiting for Nginx Proxy Manager to start..."
+  until lxc exec "$PROXY_VM" -- curl -fs -o /dev/null http://127.0.0.1:81 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if ((attempts >= 90)); then
+      die "Nginx Proxy Manager did not start within 3 minutes (see: lxc exec $PROXY_VM -- docker logs npm)"
+    fi
+    sleep 2
+  done
+}
+
+print_npm_access() {
+  echo "Nginx Proxy Manager's admin page only listens inside $PROXY_VM. Open it from your Mac through an SSH tunnel:"
+  echo "  ssh -L 8181:127.0.0.1:81 <your SSH login to $PROXY_VM>"
+  echo "then go to http://localhost:8181 (VM-GUIDE.md, section 8, has the details)."
+}
+
+# Caddy gets the sites written into its files; Nginx Proxy Manager gets them through its admin page
+publish_on_proxy() {
+  if [[ $PROXY_KIND == "caddy" ]]; then
+    echo "Publishing the sites on $PROXY_VM..."
+    publish_sites
+  fi
 }
 
 open_host_firewall() {
@@ -372,12 +455,24 @@ publish_sites() {
 
 print_sites_instructions() {
   local domain port
-  echo "Sites published through $PROXY_VM:"
-  while read -r domain port; do
-    if [[ -n $domain ]]; then
-      echo "  https://$domain -> port $port in $VM"
-    fi
-  done <<<"$SITES"
+  if [[ $PROXY_KIND == "npm" ]]; then
+    echo "Add these sites in Nginx Proxy Manager (Hosts > Proxy Hosts > Add Proxy Host):"
+    while read -r domain port; do
+      if [[ -n $domain ]]; then
+        echo "  $domain  ->  scheme http, IP $VM_IP, port $port"
+      fi
+    done <<<"$SITES"
+    echo "On the SSL tab of each: Request a new SSL Certificate, Force SSL, HTTP/2 Support."
+    echo
+    print_npm_access
+  else
+    echo "Sites published through $PROXY_VM:"
+    while read -r domain port; do
+      if [[ -n $domain ]]; then
+        echo "  https://$domain -> port $port in $VM"
+      fi
+    done <<<"$SITES"
+  fi
   echo
   echo "For HTTPS to work:"
   echo "  - Each domain needs a DNS A record pointing to the server's public IP, and no AAAA record."

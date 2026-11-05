@@ -201,63 +201,83 @@ The app must listen on `0.0.0.0`, not `127.0.0.1`. Check with `sudo lxc exec "$V
 
 ## 8. Publish websites through the proxy VM
 
-With a single server IP, ports 80 and 443 can only lead to one place. All websites therefore go through one VM, `proxy`, which runs Caddy. Caddy sends each domain to the right VM and gets HTTPS certificates automatically.
+With a single server IP, ports 80 and 443 can only lead to one place. All websites therefore go through one VM, `proxy`, which runs **Nginx Proxy Manager** (NPM). NPM sends each domain to the right VM and gets HTTPS certificates, and you manage the domains in its web interface.
 
 ```
-Internet ──> server :80/:443 ──> proxy VM (Caddy) ──┬──> site.com      → vm2:5555
-                                                     └──> api.site.com  → vm3:4444
+Internet ──> server :80/:443 ──> proxy VM (NPM) ──┬──> site.com      → vm2:5555
+                                                   └──> api.site.com  → vm3:4444
 ```
 
-`create-vm.sh` sets this up when you answer yes to "Publish web services". The first time, it creates `proxy`; after that, it adds each new VM's domains to it.
+### Setting up the proxy VM
 
-For a VM that already exists, or to add domains to a VM later, run `sudo ./publish-sites.sh` on the server. It asks for the VM and the domains, then:
+**Server:**
 
-- **Fixed IP:** if the VM has none, it fixes its current IP, which restarts the VM once.
-- **Firewall inside the VM:** if it's off, it asks before turning it on. Turning it on keeps the ports already forwarded from the server open.
-- **Existing sites:** new domains are added to the VM's file on the proxy, and the old file is put back if Caddy rejects the result.
+```bash
+sudo ./install-npm.sh
+```
 
-On the proxy VM, the configuration is split per VM:
+- **No proxy VM yet:** it creates `proxy` with NPM. `create-vm.sh` and `publish-sites.sh` also do this the first time you publish a site.
+- **A proxy VM running Caddy** (set up before the switch to NPM): it replaces Caddy with NPM in the same VM. It takes a snapshot first, downloads NPM while the sites are still online, then lists the sites to add again in NPM, and saves that list in `/root/caddy-sites-before-npm.txt`.
 
-| File | Contents |
-|---|---|
-| `/etc/caddy/Caddyfile` | Global settings, and a line that loads every file in `sites/` |
-| `/etc/caddy/sites/<vm>.caddy` | The domains of one VM |
+### Opening the admin interface
+
+The admin page only listens inside the proxy VM, so it's never exposed to the internet. Open it from your **Mac** through an SSH tunnel, using your SSH login to the proxy VM:
+
+```bash
+# with a password user and its port on the server
+ssh -p 2230 -L 8181:127.0.0.1:81 alice@<server-public-ip>
+
+# or with a "proxy-vm" entry in ~/.ssh/config
+ssh -L 8181:127.0.0.1:81 proxy-vm
+```
+
+Keep that terminal open, then go to **http://localhost:8181**. On the first visit, create the admin account. If a login page appears instead, sign in with `admin@example.com` / `changeme` and change both.
+
+### Adding a site
+
+A site needs two things: the VM's firewall must let the proxy VM reach the service's port, and NPM needs to know where to send the domain. NPM can't change firewalls in other VMs, so the scripts do that part.
+
+1. **Server:** run `sudo ./create-vm.sh` (for a new VM) or `sudo ./publish-sites.sh` (for an existing one) and enter the domains and ports. The script opens the firewall ports and prints what to enter in NPM.
+2. **NPM:** go to **Hosts → Proxy Hosts → Add Proxy Host** and fill in:
+
+| Tab | Field | Value |
+|---|---|---|
+| Details | Domain Names | `app.site.com` |
+| Details | Scheme | `http`, or `https` if the service itself speaks HTTPS |
+| Details | Forward Hostname / IP | The VM's IP |
+| Details | Forward Port | The service's port |
+| Details | Block Common Exploits | On |
+| Details | Websockets Support | On if the app uses live updates. Harmless otherwise |
+| SSL | SSL Certificate | Request a new SSL Certificate |
+| SSL | Force SSL, HTTP/2 Support | On |
+
+Click **Save**. The certificate takes a few seconds, and the site is online.
+
+To open a port by hand instead of with the scripts, on the **server**:
+
+```bash
+sudo lxc exec vm2 -- ufw allow proto tcp from <proxy-ip> to any port 3000
+sudo ufw route allow proto tcp from <proxy-ip> to <vm2-ip> port 3000
+```
 
 A site only works when all of these are true:
 
 - The domain has a DNS **A record** pointing to the server's public IP, and **no AAAA record**.
-- The service listens on `0.0.0.0` inside its VM. The VM's own firewall (ufw) only lets the proxy VM reach that port.
+- The service listens on `0.0.0.0` inside its VM.
 - TCP 80 and 443 are allowed in the hosting provider's firewall.
 
-**Check the certificates**, on the **server**:
+### Maintaining NPM
 
-```bash
-sudo lxc exec proxy -- journalctl -u caddy -n 50
-```
+All on the **server**:
 
-Look for `certificate obtained successfully` for each domain.
+| Task | Command |
+|---|---|
+| Check it's running | `sudo lxc exec proxy -- docker ps` |
+| Read its log | `sudo lxc exec proxy -- docker logs --tail 50 npm` |
+| Update it (snapshot first) | `sudo lxc snapshot proxy before-update` then `sudo lxc exec proxy -- sh -c "cd /opt/npm && docker compose pull && docker compose up -d"` |
+| Go back to Caddy (after `install-npm.sh`) | `sudo lxc exec proxy -- sh -c 'cd /opt/npm && docker compose down; systemctl enable --now caddy'` |
 
-**Add a domain by hand**, without the script, on the **server**. This example publishes port 3000 of `vm2`:
-
-```bash
-sudo lxc exec proxy -- nano /etc/caddy/sites/vm2.caddy
-```
-
-Add a block like the others, with the VM's IP:
-
-```
-app.site.com {
-	reverse_proxy 10.158.92.11:3000
-}
-```
-
-Then apply it and open the port to the proxy VM:
-
-```bash
-sudo lxc exec proxy -- sh -c "caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy"
-sudo lxc exec vm2 -- ufw allow proto tcp from <proxy-ip> to any port 3000
-sudo ufw route allow proto tcp from <proxy-ip> to 10.158.92.11 port 3000
-```
+NPM keeps its sites and certificates in `/opt/npm` inside the proxy VM, so snapshots of the VM back them up.
 
 ## 9. Monitor
 
@@ -341,7 +361,7 @@ sudo ufw status numbered       # find the VM's rules
 sudo ufw delete <number>       # repeat for each; the numbers shift after each delete
 ```
 
-If the VM had websites on the proxy VM, remove them too. Otherwise Caddy keeps answering those domains with errors:
+If the VM had websites on the proxy VM, remove them too. Otherwise the proxy keeps answering those domains with errors. In NPM, open **Hosts → Proxy Hosts**, then use the **⋮** menu of each of the VM's hosts to delete it. If the proxy VM still runs Caddy, remove the VM's site file on the **server** instead:
 
 ```bash
 sudo lxc exec proxy -- rm /etc/caddy/sites/vm2.caddy
@@ -363,7 +383,8 @@ Don't delete the `proxy` VM itself while other VMs still have websites on it.
 | `VM agent isn't currently running` | The VM is still booting | Wait 30 seconds and try again |
 | `unknown command "forward"` | LXD 4.0 doesn't have this command | Use a proxy device (section 3) |
 | A website gets `Connection refused` | The app only listens on `127.0.0.1` | Make it listen on `0.0.0.0` |
-| A proxied site shows `502 Bad Gateway` | The service isn't running, listens on `127.0.0.1` only, or the VM's ufw blocks the proxy | Check `ss -tlnp` and `ufw status` inside the VM |
-| Caddy's log shows certificate errors | DNS isn't pointing to the server, there's an AAAA record, or port 80 is blocked | Check `dig +short <domain>` on your Mac and the firewalls. Caddy retries on its own |
+| A proxied site shows `502 Bad Gateway` | The service isn't running, listens on `127.0.0.1` only, the VM's ufw blocks the proxy, or the scheme is wrong (`http` for a service that speaks HTTPS) | Check `ss -tlnp` and `ufw status` inside the VM, then the Scheme field in NPM |
+| NPM can't get a certificate | DNS isn't pointing to the server, there's an AAAA record, or port 80 is blocked | Check `dig +short <domain>` on your Mac and the firewalls, then request it again |
+| `http://localhost:8181` doesn't load | The SSH tunnel isn't open, or NPM isn't running | Open the tunnel (section 8), then check `docker ps` in the proxy VM |
 
 To see where an SSH connection stops, add `-v`: `ssh -v -p 2223 bob@<server-ip>`.
